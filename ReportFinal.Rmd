@@ -1,0 +1,678 @@
+---
+title: ""
+author: ""
+date: ""
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide")                      
+rm(list = ls())
+library(tidyverse)
+library(dplyr)
+#library(daewr)
+library(FrF2)
+library(modelr)
+```
+
+
+
+
+#### Create the factors and their levels.
+
+```{r}
+# generating design of fractional factorial
+#set.seed(12)
+library(FrF2)
+factors.full <- list(Blanchinglength = c("short", "long"), 
+                     BlanchingTemp = c("low", "high"), BakingSoda  = c("small", "large"), 
+                     PowderedMilk = c("light", "heavy"), WhiteFlour = c("light", "heavy"), 
+                     FryingDuration = c("short", "long"), HeatAdjustment = c("lm", "mh"))
+
+factors.abbr <- list(A = c("short", "long"), B = c("low", "high"), 
+                     C  = c("small", "large"), D = c("light", "heavy"), 
+                     E = c("light", "heavy"), F = c("short", "long"), G = c("lm", "mh"))
+```
+
+
+#### Create the general design of the experiment
+
+```{r}
+set.seed(133)
+design1b <- FrF2::FrF2(64, 7, generators = "ABCDEF", 
+                       randomize = TRUE, factor.names = factors.abbr, blocks = 4, seed = 133)
+#design1b$StandardOrder <- c(1:64)
+#design1b
+run_order <- data.frame(slot(design1b, "run.order"))
+design_matrix <- data.frame(design1b)
+design_matrix_aug <- cbind(run_order, design_matrix)
+design_matrix_aug <- design_matrix_aug %>% mutate(
+  run.no.in.std.order = as.character(run.no.in.std.order)
+) %>% separate(run.no.in.std.order, c("Std.Ord", "Blk", "Blk.Pos")) %>%
+  rename(Run.Ord = run.no) %>% select(Std.Ord, Run.Ord, Blk.Pos, Blocks, A, B, C, D, E, `F`, G)
+design_matrix_aug_ <- design_matrix_aug
+design_matrix_aug_ <- design_matrix_aug_ %>% mutate(
+  A = case_when( A == "short" ~ -1, TRUE ~ +1 ),
+  B = case_when( B == "low" ~ -1, TRUE ~ +1 ),
+  C = case_when( C == "small" ~ -1, TRUE ~ +1 ),
+  D = case_when( D == "light" ~ -1, TRUE ~ +1 ),
+  E = case_when( E == "light" ~ -1, TRUE ~ +1 ),
+  `F` = case_when( `F` == "short" ~ -1, TRUE ~ +1 ),
+  G = case_when( G == "lm" ~ -1, TRUE ~ +1 )
+)
+# 
+#design_matrix_aug_
+#write_csv(design_matrix_aug_, "blocked_abb.csv")
+#design_matrix_aug
+#write_csv(design_matrix_aug, "blocked_full.csv")
+#summary(design1b)
+```
+
+```{r}
+# export the full design as a table
+#xtable::xtable(design_matrix_aug_)
+```
+
+
+So we have 3 degrees of freedom for the blocks, 7 deg for the main effects, 21 deg for the 2 factor interactions, 35 deg for the three factor interactions. 3 + 7 + 21 + 35(less 3) = 3 + 7 + 21 + 32 = 63.
+
+The other degree of freedom will be used for the grand mean. There will no degrees of freedom for the error term.
+
+
+### Now read in the data
+
+```{r}
+obs <- read_csv("data_recorded.csv")
+# add the mean and standard deviation
+obs <- obs %>% mutate(y = rowMeans(.), sdY = apply(., 1, sd))
+design_f1 <- design_matrix_aug_
+design_f1 <- read_csv("full_data.csv")
+#attach the yield
+design_f1$db <- obs$y
+design_f1 <- design_f1 %>% mutate(Blocks = as.factor(Blocks)) 
+#design_f1
+#xtable::xtable(design_f1)
+```
+
+
+### EDA
+
+```{r}
+p1 <- ggplot(design_f1, aes(x = Blocks, y = db, color = Blocks)) + geom_boxplot() +  theme_bw() +
+  ylab("Yield") + theme(legend.position = "top")
+#p1
+library(reshape2)
+design_f1_melt <- melt(data = design_f1, id.var = c("db"), 
+                       measure.vars = c("A", "B", "C", "D", "E", "F", "G"))
+#design_f1_melt
+```
+
+
+
+```{r}
+p <- ggplot(data = design_f1_melt, aes(x = variable, y  = db, color = as.factor(value))) + 
+  geom_boxplot() + theme_bw() + guides(color=guide_legend(title="Factor Level")) + 
+  xlab("Factor") + ylab("Yield")
+  theme(legend.position = "top")
+```
+
+
+### Initial model fit
+
+We first fit the full specified model, that's upto three factor intwractions.
+
+
+```{r}
+design_f1_sub <- design_f1 %>% select(-c(Std.Ord, Run.Ord, Blk.Pos))
+factors_ <- c("A", "B", "C", "D", "E", "F", "G")
+oneZero <- function(x){
+  ifelse(x == -1, 0, 1)
+}
+#design_f1_sub[factors_] <- lapply(design_f1_sub[factors_], oneZero)
+design_f1_sub[factors_] <- lapply(design_f1_sub[factors_], factor)
+#design_f1_sub
+#write_csv(design_f1_sub, "trimmeddata.csv")
+```
+
+
+Fit the initial model with the sum to zero constraints.
+
+```{r}
+options(contrasts = c("contr.sum", "contr.sum"))
+init.model <- lm(db~ Blocks + (A + B + C + D + E + `F` + G)^3 - A:B:C - A:D:E - A:`F`:G, data = design_f1_sub)
+#summary(init.model)
+```
+
+Check the orthogonality of the design matrix
+
+```{r}
+M <- model.matrix(init.model)[, -1]
+#(t(M) %*% M) # We have an orthogonal design
+```
+
+Estimating the effects by dot product and compare.
+
+Extract the effects from the model fit ... check the correct way to compute the block effects
+
+
+```{r}
+effects <- coef(init.model)*2*(-1) # multiplied by -1 to manually re-level the factor levels. 
+#effects
+```
+
+We can not estimate any errors or their residuals. We now check for significant effects.
+
+
+### Fishing for significant effects.
+
+We are excluding the block effects in all these methods because block effects are basically observational and not something we can manipulate in our experiment. That's we cannot make causal inference to a blocking variable as to a treatment variable.
+
+(1) We first make a half normal plot (this is the same as the Daniel's method):
+
+```{r}
+effects.less.block <- effects[5:64]
+#halfnorm(effects.less.block, names(effects.less.block), alpha = 0.05)
+```
+
+From this we observe that the main effects, D, E, F and their interactions DE, DF, EF are significant. We also observe that AE is borderline significant.
+
+So it appears we can treat all three factor interactions as insignificant.
+
+
+
+(2) Next we implement Length's
+
+
+```{r}
+
+factors = names(effects.less.block)
+effects.table <- as_tibble(effects.less.block) %>% mutate(factor = factors) %>% rename(effect = value) %>% mutate(
+  factor = case_when(
+    nchar(factor)==2 ~ substr(factor, 1, 1),
+    nchar(factor)==5 ~ str_c(substr(factor, 1, 1), substr(factor, 4, 4)),
+    nchar(factor)==8 ~ str_c(substr(factor, 1, 1), substr(factor, 4, 4), substr(factor, 7, 7))
+  )
+)
+#effects.table
+```
+
+```{r}
+#(S1)
+g <- length(effects.table$effect)
+(s_0 <- 1.5 * median(abs(effects.table$effect)))
+(pse <- 1.5*median( abs(effects.table$effect[effects.table$effect < 2.5*s_0]) ))
+#(S2)
+nu <- g/3; alpha <- 0.05; gamma <- 0.5*(1- (1-alpha)^(1/g) ) # i'm taking the significance level to be 0.05
+#(S3)
+t_nu_gamma <- qt(gamma, nu, lower.tail = F)
+length_critical <- t_nu_gamma * pse
+effects.table$length.signf <- ifelse(abs(effects.table$effect)>length_critical, TRUE, FALSE)
+#effects.table
+```
+
+
+```{r}
+cols <- c("Not Significant"="#f04546","Length's Critical Value"="#3591d1", "Significant"="#62c76b")
+fill_col <- ifelse(effects.table$length.signf, "Significant", "Not Significant")
+p2 <- effects.table %>% 
+  ggplot(aes(x = c(1:60), y = abs(effect), color = fill_col, label = factor)) + 
+  geom_point() + 
+  geom_hline(aes(yintercept = length_critical, color = "Length's Critical Value")) + 
+  geom_text(aes(label=ifelse(abs(effect)>length_critical,factor,'')), hjust= -0.5,vjust = 0) + 
+  scale_colour_manual(name="", values=cols) +
+  #scale_fill_manual(name="CRIT", values=cols)+
+  theme_bw()+#ggtitle("Length's Method Significant Effects")+
+  ylab("Absolute Value of Effect") + xlab("Index")+
+  theme(legend.position = c(0.8, 0.8))
+```
+
+we observe that whiles Daniel's method identified AE as been significant, Length's method did not find that as significant.
+
+
+(3) Lastly we illustrate Dong's method. 
+
+```{r}
+#(S1)
+g <- length(effects.table$effect)
+(s_0 <- 1.5 * median(abs(effects.table$effect)))
+(m_1 <- sum( abs(effects.table$effect)<= 2.5*s_0 ))
+(s_1_2 <- (1/m_1) * sum( (effects.table$effect[abs(effects.table$effect) <= 2.5*s_0 ])^2 ))
+#(S2)
+(m_2 <- sum( abs(effects.table$effect)<= 2.5*sqrt(s_1_2) ))
+(s_2_2 <- (1/m_2) * sum( (effects.table$effect[abs(effects.table$effect) <= 2.5*sqrt(s_1_2) ])^2 ))
+#(S3)
+alpha <- 0.05; gamma <- 0.5*(1- (1-alpha)^(1/g) )
+t_m2_gamma <- qt(gamma, m_2, lower.tail = F)
+dong_critical <- t_nu_gamma * sqrt(s_2_2)
+effects.table$dong.signf <- ifelse(abs(effects.table$effect)>dong_critical, TRUE, FALSE)
+#effects.table
+```
+
+
+```{r}
+cols <- c("Not Significant"="#f04546","Dong's Critical Value"="#3591d1", "Significant"="#62c76b")
+fill_col <- ifelse(effects.table$dong.signf, "Significant", "Not Significant")
+p1 <- effects.table %>% 
+  ggplot(aes(x = c(1:60), y = abs(effect), color = fill_col, label = factor)) + 
+  geom_point() + 
+  geom_hline(aes(yintercept = dong_critical, color = "Dong's Critical Value")) + 
+  geom_text(aes(label=ifelse(abs(effect)>dong_critical,factor,'')), hjust= -0.5,vjust = 0) + 
+  scale_colour_manual(name="", values=cols) +
+  #scale_fill_manual(name="CRIT", values=cols)+
+  theme_bw()+#ggtitle("Length's Method Significant Effects")+
+  ylab("Absolute Value of Effect") + xlab("Index")+
+  theme(legend.position = c(0.8, 0.8))
+```
+
+We observe that Dong and Length returns the same class of significant effects.
+
+
+#### Model Refit and Diagnostics.
+
+We will now refit the model with only the significant factors and perform diagnostics.
+
+Since we have an orthogonal design, we need not refit the model.
+
+We will simply follow these four steps to obtain the relevant sum of squares and residuals;
+
+1. Parameter Estimate = (Contrast)/(2^7)
+2. Effect Estimate = 2*Parameter Estimate
+3. Sum of Squares  = (Contrast)^2/(2^7)
+4. Residuals  = dot(Contrast, yield) - yield
+
+
+Also we obtained the measure of variability as follows:
+
+1. Var{Contrast} = sigma^2*(2^7)
+2. Var{Parameter Estimate} = Var{Contrast}/(2^7)^2 = sigma^2/(2^7)
+3. Var{Effect Estimate} = sigma^2/(2^(7-1)) ... I think this should be Var{Effect Estimate} = sigma^2/(2^(7-2)) = 4*sigma^2/(2^7)
+
+
+```{r}
+trimmed.model <- lm(db~ Blocks + (D + E + `F`)^2, data = design_f1_sub)
+#summary(trimmed.model)
+```
+After removing variables with non-significant effects, we now have 54 degrees of freedom to estimate the residuals and it's variance as well perform model diagnostics.
+
+```{r}
+design_f1_sub$fitted <- trimmed.model$fitted.values
+design_f1_sub$residuals <- trimmed.model$residuals
+#design_f1_sub <- design_f1_sub %>% add_residuals(trimmed.model)
+#design_f1_sub
+```
+
+
+(1) Checking for constant variance
+
+```{r}
+p2 <- design_f1_sub %>% ggplot(aes(x = fitted, y = residuals)) + geom_point() + 
+  geom_hline(yintercept = 0, color = "red") + theme_bw() +
+  xlab("Fitted Values ") + ylab("Residuals")
+```
+
+There do not appear to be any systematic pattern in the distribution of the residuals. Hence homoschedasticity seems to be satisfied.
+
+
+(2) Checking the normality assumption of the errors.
+
+```{r}
+normal_scores <- qqnorm(design_f1_sub$residuals, plot.it = FALSE)
+design_f1_sub$normal_scores <- normal_scores$x
+```
+
+```{r}
+p3 <- design_f1_sub %>% 
+  ggplot(aes(sample = residuals)) + stat_qq() + stat_qq_line(color = "red") + #+ geom_point(alpha = 0.5) +
+  #geom_line(linetype = 3) + geom_abline(slope = 1, intercept = 0, color = "red") + 
+  ylab("Sample Quantiles") + xlab("Theoretical Quantiles") +
+  theme_bw()
+```
+
+The normality assumption seems quite satisfied in this instance.
+
+
+(3) Since we have a sequence order of the experimental run, we can check to see if the residua;s are correlated over time.
+
+```{r}
+design_f1_sub$run_order <- design_f1$Run.Ord
+p3 <- design_f1_sub %>% 
+  ggplot(aes(x = run_order, y = residuals)) + geom_line() + geom_point(alpha = 0.25, color = "red") +
+  geom_vline(xintercept = 16, color = "blue", linetype = 2, alpha = 0.5)+
+  geom_vline(xintercept = 32, color = "blue", linetype = 2, alpha = 0.5)+
+  geom_vline(xintercept = 48, color = "blue", linetype = 2, alpha = 0.5)+
+  ylab("Reisiduals") + xlab("Run Order") +
+  theme_bw()
+```
+
+The three dashed blue lines indicates the block grouping.
+
+
+```{r}
+p3 <- tail_resid <- tail(design_f1_sub$residuals, 63)
+head_resid <- head(design_f1_sub$residuals, 63)
+temp_df <- data.frame(tail_resid, head_resid)
+p1 <- ggplot(data = temp_df, aes(x = tail_resid, y = head_resid)) + geom_point(alpha = 0.25, color = "red") +
+geom_vline(xintercept = 0, color = "blue", linetype = 2, alpha = 0.5)+
+geom_hline(yintercept = 0, color = "blue", linetype = 2, alpha = 0.5)+
+ylab(expression(hat(epsilon)[i+1])) + xlab(expression(hat(epsilon)[i])) +
+theme_bw()
+```
+
+It appears the residuals were relatively large at the initial stages of the experiment run and seems to decrease as time progresses. But we also note that this is not extremely pronounced and hence, our analysis are still valid without any drastic remedial measure.
+
+
+We contend that, the model does not inhabit any serious violations of any of the assumptions tested. But nonetheless we will carry out a box-cox transformation to see if any of the diagnostics will be improved.
+
+
+To proceed with the box-cox transformation, we adopt the following steps.
+
+
+(1) We find the best lambda on the additive model that makes the model satisfies the independence, normality, and equal variance assumptions.
+
+(2) Now use these transformed yield to construct confidence intervals for the main effects and the 2fi interactions.
+
+(3) Our goal to get rid of the two-factor interactions if possible.
+
+
+```{r}
+# option 1 - manual computation.
+y0 <- design_f1_sub$db
+SSR <- NULL
+lambda.seq <- seq(from = -2, to = 5, length.out = 30)
+gm <- exp(mean(log(y0)))
+for (lambda in lambda.seq) {
+  if(lambda==0){
+    yBC <- log(y0)*gm
+  }else{
+    yBC <-  (y0^lambda - 1)/( lambda * gm^(lambda -1) )
+  }
+  design_f1_sub$yBC <- yBC
+  trans.model <- lm(yBC~Blocks + A + B + C + D + E + `F` + G, data = design_f1_sub)
+  SSR <- c(SSR, sum(trans.model$resid^2))
+}
+temp_df2 <- data.frame(lambda.seq, SSR)
+best_lambda <- temp_df2$lambda.seq[temp_df2$SSR==min(temp_df2$SSR)]
+p4 <- ggplot(data = temp_df2, aes(x = lambda.seq, y = SSR)) + 
+  geom_point() + geom_vline(xintercept = best_lambda, color = "red", linetype = 2)+
+  xlab(expression(paste("Lambda (", lambda, ")", ))) + 
+  ylab(expression(paste("SSR=", sum( (y[i]^lambda - hat(y[i])^lambda)^2 ) ))) + theme_bw() +
+  annotate('text', x = best_lambda-0.5, y = 200, label = "lambda==2.34 ", parse = TRUE, color = "red")
+```
+
+Interestingly, once you include the significant effects identified by the previous three methods, the box-cox lambda indicates that no transformation might be necessary.
+
+```{r}
+# now add the transformed bd to the data
+design_f1_sub <- design_f1_sub %>% mutate(
+  dbT = db^best_lambda
+)
+#design_f1_sub
+```
+
+We now refit the model, still excluding the three-factor interactions, we then construct confidence intervals to check if any of the two-factor interactions are still significant
+
+
+```{r}
+trans.model <- lm(dbT~Blocks + (A + B + C + D + E + `F` + G)^2, data = design_f1_sub)
+#summary(trans.model)
+```
+
+We will construct simultaneous Bonferroni confidence intervals.
+
+We are interested in a total of 28 contrasts. To construct simultaneous confidence intervals with an overall confidence level of $95\%$, we have a scaled alpha of $\alpha/2g$. This will be based on 32 error degrees of freedom.
+
+
+```{r}
+g <- 28 # this consist of 21 two factor interactions, 7 main effects
+k <- 7 # number of factors
+r <- 4 # number of blocks ... not correct if you have replicates, this is the number of replicates
+nu <- (2^k - 1)*(r - 1)
+sigma <- 667.6
+alpha <- 0.05
+t_critical <- qt(alpha/(2*g), df = nu, lower.tail = FALSE)
+m_05_g_nu <- 3.12
+se <- sqrt( (sigma^2)/(2^k) )
+margin.err <- t_critical*se
+margin.err2 <- m_05_g_nu*se
+mm_threshold <- 2*m_05_g_nu*se
+effects <- (coef(trans.model)*2*(-1))[-c(1,2,3,4)] # multiplied by -1 to manually re-level the factor levels.
+factors = names(effects)
+effects.table <- as_tibble(effects) %>% mutate(factor = factors) %>% rename(effect = value) %>% mutate(
+  factor = case_when(
+    nchar(factor)==2 ~ substr(factor, 1, 1),
+    nchar(factor)==5 ~ str_c(substr(factor, 1, 1), substr(factor, 4, 4))
+  )
+)
+effects.table <- effects.table %>% mutate(
+  lower.ci.bf = effect - margin.err,
+  upper.ci.bf = effect + margin.err,
+  lower.ci.m = effect - margin.err2,
+  upper.ci.m = effect + margin.err2,
+  index = c(1:length(factors)),
+  signf.mm  = ifelse(abs(effect) > mm_threshold, TRUE, FALSE)
+)
+#effects.table
+```
+
+```{r}
+cols <- c("Not Significant"="#f04546","SMM Threshold"="#3591d1", "Significant"="#62c76b")
+fill_col <- ifelse(effects.table$signf.mm, "Significant", "Not Significant")
+p3 <- effects.table %>% 
+  ggplot(aes(x = c(1:28), y = abs(effect), color = fill_col, label = factor)) + 
+  geom_point() + 
+  geom_hline(aes(yintercept = mm_threshold, color = "SMM Threshold")) + 
+  geom_text(aes(label=ifelse(abs(effect)>mm_threshold,factor,factor)), hjust= -0.5,vjust = 0) + 
+  annotate('text', x = 4, y = 700, label = "{M}[21][ ', ' ][381]^(0.05)==368.21", parse = TRUE, color = "#3591d1") +
+  scale_colour_manual(name="", values=cols) +
+  #scale_fill_manual(name="CRIT", values=cols)+
+  theme_bw()+#ggtitle("Length's Method Significant Effects")+
+  ylab("Absolute Value of Effect") + xlab("Index")+
+  theme(legend.position = c(0.8, 0.8))
+```
+
+We observe that the significant main effects identified are the same as before the model transformation. But the EF interaction term which was significant before transformation is no longer significant. Before we decide whether or not to maintain the previous model, we will check to see if the model diagnostics are significantly better.
+
+
+### Model refit after transformation
+
+
+```{r}
+trans.trimmed.model <- lm(dbT~ Blocks + D*E + D*`F`, data = design_f1_sub)
+#summary(trans.trimmed.model)
+```
+After removing variables with non-significant effects, we now have 54 degrees of freedom to estimate the residuals and it's variance as well perform model diagnostics.
+
+```{r}
+design_f1_sub$fitted.trans <- trans.trimmed.model$fitted.values
+design_f1_sub$residuals.trans <- residuals(trans.trimmed.model)
+design_f1_sub$residuals.trans.stan <- rstandard(trans.trimmed.model)
+#design_f1_sub <- design_f1_sub %>% add_residuals(trimmed.model)
+#design_f1_sub
+```
+
+
+(1) Checking for constant variance
+
+```{r}
+p4 <- design_f1_sub %>% ggplot(aes(x = fitted.trans, y = residuals.trans)) + geom_point() + 
+  geom_hline(yintercept = 0, color = "red") + theme_bw() +
+  xlab("Fitted Values") + ylab("Residuals")
+```
+
+41, 51 and 57 seems outlying
+
+There do not appear to be any systematic pattern in the distribution of the residuals. Hence homoschedasticity seems to be satisfied.
+
+
+(2) Checking the normality assumption of the errors.
+
+```{r}
+normal_scores_trans <- qqnorm(design_f1_sub$residuals.trans, plot.it = FALSE)
+design_f1_sub$normal_scores_trans <- normal_scores_trans$x
+```
+
+
+```{r}
+p5 <- design_f1_sub %>% 
+  ggplot(aes(sample = residuals.trans)) + #+ geom_point(alpha = 0.5) +
+  stat_qq() + stat_qq_line(color = "red") +
+  #geom_line(linetype = 3) + geom_abline(slope = 1, intercept = 0, color = "red") + 
+  ylab("Sample Quantiles") + xlab("Theoretical Quantiles") +
+  theme_bw()
+```
+
+The normality assumption seems quite satisfied in this instance.
+
+
+(3) Since we have a sequence order of the experimental run, we can check to see if the residua;s are correlated over time.
+
+```{r}
+#design_f1_sub$run_order <- design_f1$Run.Ord
+p4 <- design_f1_sub %>% 
+  ggplot(aes(x = run_order, y = residuals.trans)) + geom_line() + geom_point(alpha = 0.25, color = "red") +
+  geom_vline(xintercept = 16, color = "blue", linetype = 2, alpha = 0.5)+
+  geom_vline(xintercept = 32, color = "blue", linetype = 2, alpha = 0.5)+
+  geom_vline(xintercept = 48, color = "blue", linetype = 2, alpha = 0.5)+
+  ylab("Standardized Reisiduals") + xlab("Run Order") +
+  theme_bw()
+```
+
+The three dashed blue lines indicates the block grouping.
+
+
+```{r}
+tail_resid <- tail(design_f1_sub$residuals.trans, 63)
+head_resid <- head(design_f1_sub$residuals.trans, 63)
+temp_df <- data.frame(tail_resid, head_resid)
+p3 <- ggplot(data = temp_df, aes(x = tail_resid, y = head_resid)) + geom_point(alpha = 0.25, color = "red") +
+geom_vline(xintercept = 0, color = "blue", linetype = 2, alpha = 0.5)+
+geom_hline(yintercept = 0, color = "blue", linetype = 2, alpha = 0.5)+
+ylab(expression(hat(epsilon)[i+1])) + xlab(expression(hat(epsilon)[i])) +
+theme_bw()
+```
+
+We observe that the significant effects after BoxCox transformation did not yield better diagnostics. And in fact we do not have the benefit of  strongly parsimonious model which will allow for easy interpretation. The only reason why we would choose to work with the transformed model is if it has better predictions. 
+
+The R^2: This is in general a bad metric to compare two models. Adding more predictors essentially increases it. The adjusted R^2 corrects for this. We observe that M1 has higher adjusted R^2 compared to M2. This essentially implies more variation in the response can be explained by the factors in M1 compared to M2.
+
+
+Hence there are no appareent benefits of working with the transformed model.
+
+
+### Analysis and Intrepretation
+
+We now explore the effects of the chosen model and what they mean in terms of the question of interest.
+
+
+```{r}
+final.model <- lm(db ~ Blocks + (D + E + `F`)^2, data = design_f1_sub)
+#summary(final.model)
+```
+
+
+We first construct the anova table:
+
+```{r}
+final.aov <- anova(final.model)
+#final.aov
+```
+
+
+In constructing the P-values, we controlled the family-wise error rate at 5% significance level using the Holm's method which is less conservative compared to the Bonferroni method.
+
+```{r}
+anova_table <- tibble(
+  "Source" = c("Blocks", "D", "E", "F", "DE", "DF", "EF", "Residuals"),
+  "DF" = final.aov$Df,
+  "SS" = final.aov$`Sum Sq`,
+  "MS" = final.aov$`Sum Sq`,
+  "F Value" = final.aov$`F value`,
+  "Pr(>F)" = final.aov$`Pr(>F)`,
+  "Pr(>F) (Holm Adjusted)" = c(p.adjust(final.aov$`Pr(>F)`[-8], method = "holm"), NA)
+)
+total <- data.frame("Total", sum(anova_table$DF), sum(anova_table$SS), NA, NA, NA, NA)
+colnames(total) <- names(anova_table)
+anova_table <- rbind(anova_table, total)
+# mutate to add the ratio and p-value
+#anova_table <- anova_table %>% 
+#  mutate(FRatio = MS/MS[8], Pvalue = pf(FRatio, DF, DF[8], lower.tail = FALSE)  )
+#anova_table 
+#anova_table
+#xtable::xtable(anova_table)
+```
+
+
+```{r}
+tibble(
+  "Effect"  =  anova_table$Source[-9],
+  "Variation Explained" = paste(round(anova_table$SS[-9]/anova_table$SS[9] * 100, 2), "%")
+)
+```
+
+We see that the level of white flour and frying duration explains more 75% of the variation in the level of crunchiness. The interaction effects explains quite little.
+
+
+We now explore the nature of the interaction relationships.
+
+
+```{r}
+final.values <- broom::augment(final.model)
+#final.values
+```
+
+```{r}
+#summary(final.values$.fitted)
+#summary(final.values$db)
+```
+
+
+
+```{r}
+fp4 <- final.values %>% group_by(D, E) %>% summarize(db_group = mean(db))%>%
+  ggplot() +
+  aes(x = D, y = db_group, color = E) +
+  geom_line(aes(group = E)) +
+  geom_point()+ xlab("Factor D (Powdered Milk)") + ylab("Mean Yield") +
+  theme_bw() + guides(color=guide_legend(title="Factor E (White Flour)")) +
+  theme(legend.position = c(0.85, 0.89))
+```
+
+
+This plot shows when a High D is used, decreasing E increase the level of crunchiness. At a low level of D, still decreasing E will result in an increase in the level of crunchiness. We must state, the interaction effect is not that considering the lines are somewhat close to been parallel. But what's striking about this interaction is that, if a high level of D is used, increasing E reduces the level of crunchiness by about 20%. Similar observations can also be made when we're at the high value of E and we increase the level of D.
+
+
+```{r}
+p1 <- final.values %>% group_by(D, `F`) %>% summarize(db_group = mean(db))%>%
+  ggplot() +
+  aes(x = D, y = db_group, color = `F`) +
+  geom_line(aes(group = `F`)) +
+  geom_point() + geom_point()+ xlab("Factor D (Powdered Milk)") + ylab("Mean Yield") +
+  theme_bw() + guides(color=guide_legend(title="Factor F (Frying Duration)")) +
+  theme(legend.position = c(0.85, 0.89))
+```
+
+
+
+
+```{r}
+p3 <- final.values %>% group_by(E, `F`) %>% summarize(db_group = mean(db))%>%
+  ggplot() +
+  aes(x = E, y = db_group, color = `F`) +
+  geom_line(aes(group = `F`)) +
+  geom_point() + 
+  geom_point() + geom_point()+ xlab("Factor E (White Flour)") + ylab("Mean Yield") +
+  theme_bw() + guides(color=guide_legend(title="Factor F (Frying Duration)")) +
+  theme(legend.position = c(0.85, 0.89))
+```
+Similarly results hold as in the previous plot with E replaced by D.
+
+
+
+#### Finally we state the optimal settings for achieveing a desiired level of crunchiness (mostly high crunchiness).
+
+Based on the analysis, we can select factor levels that either maximize or minimize the level of crunchiness.
+
+The maximum level of crunchiness can be achieved by setting D to be at teh low level, E to be at the low level, and F to be at the high level.
+
+The minimum level of crunchiness can be achieve by setting both D and E at their high levels and setting F to at it's low levels. 
+
